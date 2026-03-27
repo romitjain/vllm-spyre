@@ -7,14 +7,14 @@ Scans custom_ops/ for OOT class registrations and finds upstream tests that
 import or instantiate those upstream classes.
 
 Usage:
-    python scripts/discover_upstream_tests.py
-    python scripts/discover_upstream_tests.py --class SpyreRMSNorm
-    python scripts/discover_upstream_tests.py --upstream-tests ../vllm/tests
+    python scripts/discover_upstream_tests.py --vllm-tests ../vllm/tests
+    python scripts/discover_upstream_tests.py --vllm-tests ../vllm/tests --class SpyreRMSNorm
 """
 
 import argparse
 import ast
-from dataclasses import dataclass
+import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -35,12 +35,17 @@ class TestMatch:
     test_file: Path
     imports_class: bool
     instantiates_class: bool
+    test_functions: list[str] = field(default_factory=list)
 
     @property
     def confidence(self) -> str:
         if self.imports_class and self.instantiates_class:
             return "direct"
         return "integration"
+
+    @property
+    def test_count(self) -> int:
+        return len(self.test_functions)
 
 
 def has_register_oot_decorator(node: ast.ClassDef) -> bool:
@@ -145,6 +150,15 @@ def check_instantiates_class(tree: ast.Module, class_name: str) -> bool:
     return False
 
 
+def extract_test_functions(tree: ast.Module) -> list[str]:
+    """Extract all test function names from the AST."""
+    test_functions = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
+            test_functions.append(node.name)
+    return test_functions
+
+
 def find_tests_using_class(class_name: str, tests_dir: Path) -> list[TestMatch]:
     """Find all test files that import or instantiate the given class."""
     matches = []
@@ -160,11 +174,13 @@ def find_tests_using_class(class_name: str, tests_dir: Path) -> list[TestMatch]:
         instantiates = check_instantiates_class(tree, class_name)
 
         if imports or instantiates:
+            test_functions = extract_test_functions(tree)
             matches.append(
                 TestMatch(
                     test_file=test_file,
                     imports_class=imports,
                     instantiates_class=instantiates,
+                    test_functions=test_functions,
                 )
             )
 
@@ -179,6 +195,9 @@ def print_results(
     """Print discovered tests grouped by OOT class and confidence."""
     print("Discovering upstream tests for OOT implementations...\n")
 
+    total_files = 0
+    total_tests = 0
+
     for reg in registrations:
         matches = results.get(reg.oot_class, [])
         print(f"{reg.oot_class} (replaces {reg.upstream_class} from {reg.upstream_module})")
@@ -186,48 +205,35 @@ def print_results(
         direct = [m for m in matches if m.confidence == "direct"]
         integration = [m for m in matches if m.confidence == "integration"]
 
+        reg_files = len(matches)
+        reg_tests = sum(m.test_count for m in matches)
+        total_files += reg_files
+        total_tests += reg_tests
+
         if direct:
-            print("  Direct tests (high confidence):")
+            direct_tests = sum(m.test_count for m in direct)
+            print(f"  Direct tests ({len(direct)} files, {direct_tests} test functions):")
             for match in direct:
                 rel_path = match.test_file.relative_to(tests_dir)
                 print(f"    {rel_path}")
+                for func in match.test_functions:
+                    print(f"      - {func}")
 
         if integration:
-            print("  Integration tests (medium confidence):")
+            integration_tests = sum(m.test_count for m in integration)
+            print(f"  Integration tests ({len(integration)} files, {integration_tests} test functions):")
             for match in integration:
                 rel_path = match.test_file.relative_to(tests_dir)
                 print(f"    {rel_path}")
+                for func in match.test_functions:
+                    print(f"      - {func}")
 
         if not matches:
             print("  No tests found")
 
         print()
 
-
-def resolve_upstream_tests_dir(args_path: str | None) -> Path:
-    """Resolve the upstream tests directory."""
-    if args_path:
-        return Path(args_path)
-
-    # Try ../vllm/tests relative to this script
-    script_dir = Path(__file__).parent
-    vllm_tests = script_dir.parent.parent.parent / "vllm" / "tests"
-    if vllm_tests.exists():
-        return vllm_tests
-
-    # Try cached location
-    cache_dir = Path.home() / ".cache" / "vllm-upstream-tests"
-    if cache_dir.exists():
-        # Find the first subdirectory with tests
-        for subdir in cache_dir.iterdir():
-            tests_path = subdir / "tests"
-            if tests_path.exists():
-                return tests_path
-
-    raise FileNotFoundError(
-        "Could not find upstream tests directory. "
-        "Use --upstream-tests to specify the path."
-    )
+    print(f"Summary: {total_files} test files, {total_tests} test functions")
 
 
 def main():
@@ -235,31 +241,34 @@ def main():
         description="Discover upstream vLLM tests for OOT implementations"
     )
     parser.add_argument(
+        "--vllm-tests",
+        dest="vllm_tests",
+        required=True,
+        help="Path to upstream vLLM tests directory (required)",
+    )
+    parser.add_argument(
         "--class",
         dest="oot_class",
         help="Filter to a specific OOT class (e.g., SpyreRMSNorm)",
     )
-    parser.add_argument(
-        "--upstream-tests",
-        dest="upstream_tests",
-        help="Path to upstream vLLM tests directory",
-    )
     args = parser.parse_args()
+
+    # Validate vllm tests directory
+    tests_dir = Path(args.vllm_tests)
+    if not tests_dir.exists():
+        print(f"Error: vLLM tests directory does not exist: {tests_dir}", file=sys.stderr)
+        sys.exit(1)
+    if not tests_dir.is_dir():
+        print(f"Error: vLLM tests path is not a directory: {tests_dir}", file=sys.stderr)
+        sys.exit(1)
 
     # Find custom_ops directory
     script_dir = Path(__file__).parent
     custom_ops_dir = script_dir.parent / "vllm_spyre_next" / "custom_ops"
 
     if not custom_ops_dir.exists():
-        print(f"Error: custom_ops directory not found at {custom_ops_dir}")
-        return 1
-
-    # Find upstream tests directory
-    try:
-        tests_dir = resolve_upstream_tests_dir(args.upstream_tests)
-    except FileNotFoundError as e:
-        print(f"Error: {e}")
-        return 1
+        print(f"Error: custom_ops directory not found at {custom_ops_dir}", file=sys.stderr)
+        sys.exit(1)
 
     print(f"Custom ops dir: {custom_ops_dir}")
     print(f"Upstream tests dir: {tests_dir}\n")
@@ -267,12 +276,20 @@ def main():
     # Parse OOT registrations
     registrations = find_oot_classes(custom_ops_dir)
 
-    if args.oot_class:
-        registrations = [r for r in registrations if r.oot_class == args.oot_class]
-
     if not registrations:
-        print("No OOT registrations found")
-        return 0
+        print("Error: No OOT registrations found in custom_ops/", file=sys.stderr)
+        sys.exit(1)
+
+    if args.oot_class:
+        filtered = [r for r in registrations if r.oot_class == args.oot_class]
+        if not filtered:
+            available = ", ".join(r.oot_class for r in registrations)
+            print(
+                f"Error: OOT class '{args.oot_class}' not found. Available: {available}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        registrations = filtered
 
     # Find matching tests for each registration
     results: dict[str, list[TestMatch]] = {}
@@ -283,8 +300,6 @@ def main():
     # Print results
     print_results(registrations, results, tests_dir)
 
-    return 0
-
 
 if __name__ == "__main__":
-    exit(main())
+    main()
